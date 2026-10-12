@@ -1,49 +1,20 @@
-# Integración con Stroku (Roku)
+# Conexión con el canal Stroku (Roku)
 
-El código de Stroku para Roku **no está en este repositorio**, así que no se ha modificado ni probado nada del lado Roku.
-Esto es lo que hay que cambiar allí. Solo afecta a enlaces magnet; el reproductor original y Live TV no se tocan.
+El Roku **no necesita cambios de código**. El APK implementa el contrato que Stroku ya usa:
 
-## URL que debe generar Stroku
+- `GET /stream?url=<URL KiraLT codificada>`  (Range, HEAD)
+- `GET /probe?url=...`  y  `GET /warm?url=...`  (JSON)
+- La URL interna tiene la forma `http://127.0.0.1:3000/stream/<magnet codificado>[?file=<nombre>|?fileIndex=<n, base 1>]`.
+  El gateway **solo valida** esa URL y extrae el magnet; nunca se conecta a lo que diga la URL.
 
-    http://<IP-del-teléfono>:4001/play?magnet=<magnet URL-encoded>
+## Configurar
+1. En el teléfono: abre la app, pulsa INICIAR SERVIDOR y copia la dirección `http://IP:4001`.
+2. En Stroku (Roku): configura el gateway P2P con esa dirección (ajustes / clave `p2pGateway`).
+   La IP del teléfono puede cambiar con el router; la app la muestra cada vez.
 
-El gateway acepta también el magnet sin codificar, pero conviene codificarlo.
-
-## Cambio mínimo en `P2PPlaybackUrl` (basado en el fragmento que compartiste; sin probar)
-
-```brightscript
-function P2PPlaybackUrl(stream as object, contentType as string) as string
-    sourceUrl = DirectStreamUrl(stream)
-
-    if sourceUrl = "" then return ""
-    if contentType = "live" then return sourceUrl          ' Live TV: sin cambios
-    if not IsMagnetUrl(sourceUrl) then return sourceUrl     ' HTTP/HTTPS: reproductor original
-
-    base = P2PGatewayBase()                                 ' p. ej. "http://192.168.2.120:4001"
-    if base = "" then return ""                             ' sin gateway configurado: no se inventa nada
-
-    xfer = CreateObject("roUrlTransfer")
-    return base + "/play?magnet=" + xfer.Escape(sourceUrl)
-end function
-
-function P2PGatewayBase() as string
-    sec = CreateObject("roRegistrySection", "stroku")
-    if sec.Exists("p2pGateway") then return sec.Read("p2pGateway")
-    return ""
-end function
-```
-
-`P2PGatewayBase` lee la dirección del registro del Roku, así que **no hay IP fija en el código**.
-Hace falta una pantalla de ajustes (o similar) donde el usuario escriba la dirección que muestra la app
-del teléfono y se guarde con `sec.Write("p2pGateway", valor) : sec.Flush()`.
-
-## Autodetección de la IP
-
-No está implementada ni probada. El Roku no puede descubrir al teléfono sin un mecanismo extra (SSDP/mDNS),
-que la app todavía no publica. Hasta entonces la dirección se escribe a mano en Stroku. Si el router
-reasigna la IP del teléfono, conviene reservarla (DHCP estático) en el router.
-
-## Compatibilidad de vídeo
-
-El teléfono sirve el archivo tal cual. Si el torrent trae un códec que el Roku no reproduce
-(p. ej. algunos HEVC/AC3/DTS en MKV), el Roku fallará aunque el servidor funcione.
+## Límites conocidos
+- `lang`, `quality` y `codec` se aceptan y se devuelven en `/probe` y `/warm`, pero no cambian la selección de archivo.
+- `/cache` no está implementado (Stroku no lo usa).
+- El puerto 3000 es el motor propio de la app (no KiraLT). Si otra app ocupa el 3000, el motor usa otro puerto
+  interno y el gateway sigue aceptando las URL `:3000` del Roku.
+- Sin probar en un dispositivo real salvo lo que reporte el usuario.
