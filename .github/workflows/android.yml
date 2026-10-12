@@ -38,7 +38,20 @@ jobs:
           gradle-version: '8.11.1'
 
       - name: Build APK
-        run: gradle -p stroku-p2p-android assembleDebug
+        run: |
+          mkdir -p build
+          set +e
+          gradle -p stroku-p2p-android assembleDebug --console=plain --stacktrace > build/gradle.log 2>&1
+          rc=$?
+          set -e
+          tail -n 80 build/gradle.log
+          if [ "$rc" -ne 0 ]; then
+            # Put the real errors in a check annotation so they can be read without downloading logs.
+            msg=$(grep -E "error:|What went wrong|Could not|Execution failed|FAILURE|symbol:|location:|cannot find|incompatible|Unresolved|not found" build/gradle.log \
+                  | head -30 | cut -c1-320 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Gradle build failed::${msg}"
+          fi
+          exit $rc
 
       - name: Verify APK contents
         run: |
