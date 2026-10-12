@@ -103,7 +103,7 @@ public final class LibtorrentBackend implements TorrentBackend {
         long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
         try {
             TorrentHandle h = null;
-            while ((h = sm.find(new Sha1Hash(p.infoHash))) == null) {
+            while ((h = sm.find(Sha1Hash.fromBytes(hexToBytes(p.infoHash)))) == null) {
                 if (System.nanoTime() > deadline) throw new IOException("torrent was not registered by the engine in time");
                 Thread.sleep(150);
             }
@@ -154,6 +154,14 @@ public final class LibtorrentBackend implements TorrentBackend {
         } catch (Throwable t) {
             throw new IOException("engine error: " + t, t);
         }
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
+        }
+        return out;
     }
 
     private static boolean isVideo(String path) {
@@ -251,7 +259,7 @@ public final class LibtorrentBackend implements TorrentBackend {
         if (e.selectedFile == fileIndex) return;
         int n = e.meta.files.size();
         Priority[] pr = new Priority[n];
-        for (int i = 0; i < n; i++) pr[i] = i == fileIndex ? Priority.NORMAL : Priority.IGNORE;
+        for (int i = 0; i < n; i++) pr[i] = i == fileIndex ? Priority.DEFAULT : Priority.IGNORE;
         e.handle.prioritizeFiles(pr);
         e.selectedFile = fileIndex;
         e.tailRequested = false;
