@@ -12,6 +12,8 @@ public final class Config {
     public String gatewayBind = "0.0.0.0";
     public int gatewayPort = 4001;
     public String engineHost = "127.0.0.1"; // fixed: the only upstream the gateway may talk to
+    /** Port the Roku app puts in its KiraLT-style URLs; only validated, never connected to. */
+    public final int contractEnginePort = 3000;
     public int enginePort = 3000;
 
     // Gateway block cache (reference values from the earlier Node gateway)

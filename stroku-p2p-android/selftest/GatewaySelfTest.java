@@ -172,6 +172,22 @@ public class GatewaySelfTest {
         return n;
     }
 
+    /** Same encoding Roku's EncodeUrlComponent produces: everything except unreserved characters. */
+    static String enc(String v) throws UnsupportedEncodingException {
+        return URLEncoder.encode(v, "UTF-8").replace("+", "%20");
+    }
+
+    /** The KiraLT-style URL Stroku builds: http://127.0.0.1:3000/stream/<encoded magnet>[?file=...] */
+    static String kira(int enginePort, String magnet, String query) throws UnsupportedEncodingException {
+        return "http://127.0.0.1:" + enginePort + "/stream/" + enc(magnet) + query;
+    }
+
+    /** The gateway URL Stroku builds: <base>/<route>?url=<encoded kira url>&lang=...&quality=...&codec=... */
+    static String strokuUrl(int gwPort, String route, String kiraUrl) throws UnsupportedEncodingException {
+        return "http://127.0.0.1:" + gwPort + "/" + route + "?url=" + enc(kiraUrl)
+                + "&lang=Spanish&quality=1080p&codec=Auto";
+    }
+
     static File[] files(File dir, String suffix) {
         File[] fs = dir.listFiles((d, n) -> n.endsWith(suffix));
         return fs == null ? new File[0] : fs;
@@ -358,6 +374,94 @@ public class GatewaySelfTest {
         check(allOk, "16 concurrent random ranges all correct");
         check(cache.totalBytes() <= cfg.maxCache, "cache limit still respected after concurrency: " + cache.totalBytes());
         check(tmpFilesAfterSettling(cfg.cacheDir) == 0, "no leftover .tmp files after the concurrency burst");
+
+        System.out.println("\n[9] Stroku contract (/stream?url=, /probe, /warm) as the Roku app calls it");
+        int ep = cfg.enginePort;
+        String k1 = kira(ep, magnet(HASH1), "");
+        r = http("GET", strokuUrl(gp, "stream", kira(cfg.contractEnginePort, magnet(HASH1), "")), "bytes=0-9");
+        check(r.code == 206 && cfg.contractEnginePort != ep, "Roku's http://127.0.0.1:3000/... works although the engine runs on port " + ep);
+        r = http("GET", strokuUrl(gp, "stream", k1), "bytes=0-99");
+        check(r.code == 206 && r.h("Content-Range").equals("bytes 0-99/" + SIZE1) && bodyMatches(r.body, 0),
+                "/stream?url=<kira url> -> 206, same bytes");
+        r = http("GET", strokuUrl(gp, "stream", k1), "bytes=300000-700000");
+        check(r.code == 206 && r.body.length == 400001 && bodyMatches(r.body, 300000), "Stroku-style range across blocks");
+        r = http("GET", strokuUrl(gp, "stream", kira(ep, magnet(HASH1), "?fileIndex=2")), "bytes=0-99");
+        check(r.code == 206 && r.h("Content-Range").equals("bytes 0-99/100"), "?fileIndex=2 (one-based) selects the 2nd file");
+        r = http("GET", strokuUrl(gp, "stream", kira(ep, magnet(HASH1), "?file=" + enc("readme.nfo"))), "bytes=0-9");
+        check(r.code == 206 && r.h("Content-Range").equals("bytes 0-9/100"), "?file=<name> selects the file by name");
+        r = http("GET", strokuUrl(gp, "stream", kira(ep, magnet(HASH1), "?file=" + enc("movie.mkv"))), "bytes=0-9");
+        check(r.code == 206 && r.h("Content-Range").equals("bytes 0-9/" + SIZE1), "?file=movie.mkv selects the main video");
+        r = http("GET", strokuUrl(gp, "stream", kira(ep, magnet(HASH1), "?fileIndex=99")), "bytes=0-9");
+        check(r.code == 206 && r.h("Content-Range").equals("bytes 0-9/" + SIZE1), "out-of-range fileIndex falls back to the main video");
+        r = http("HEAD", strokuUrl(gp, "stream", k1), null);
+        check(r.code == 200 && String.valueOf(SIZE1).equals(r.h("Content-Length")), "HEAD on /stream?url= -> headers only");
+
+        r = http("GET", strokuUrl(gp, "probe", k1), null);
+        String pb = new String(r.body, "UTF-8");
+        check(r.code == 200 && pb.contains("\"ok\":true") && pb.contains("\"stable\":") && pb.contains("\"throughputBytesPerSec\":")
+                && pb.contains("\"quality\":\"1080p\"") && pb.contains("\"blocks\":3"), "/probe measures 3 blocks: " + pb);
+        r = http("GET", strokuUrl(gp, "warm", k1), null);
+        String wb = new String(r.body, "UTF-8");
+        check(r.code == 200 && wb.contains("\"ok\":true") && wb.contains("\"sizeBytes\":" + SIZE1) && wb.contains("\"cache\":\"ready\""),
+                "/warm preloads and reports size: " + wb);
+        check(cache.has(BlockCache.key(HASH1, 0, 0)), "block 0 is in the cache after /warm");
+
+        String[] denied = {
+                "http://127.0.0.1:" + (ep + 7) + "/stream/" + enc(magnet(HASH1)),          // wrong port
+                "http://evil.example:" + ep + "/stream/" + enc(magnet(HASH1)),               // wrong host
+                "http://localhost:" + ep + "/stream/" + enc(magnet(HASH1)),                  // not the fixed loopback literal
+                "http://127.0.0.1:" + ep + "@evil.example/stream/" + enc(magnet(HASH1)),     // userinfo trick
+                "http://user:pw@127.0.0.1:" + ep + "/stream/" + enc(magnet(HASH1)),          // userinfo
+                "http://127.0.0.1:" + ep + "/other/" + enc(magnet(HASH1)),                   // wrong path
+                "http://127.0.0.1:" + ep + "/stream/a/b",                                    // extra path segment
+                "http://127.0.0.1:" + ep + "/stream/" + enc(magnet(HASH1)) + "#frag",        // fragment
+                "file:///etc/passwd",
+                "ftp://127.0.0.1:" + ep + "/stream/x",
+                "http://169.254.169.254/latest/meta-data/",
+        };
+        boolean allDenied = true;
+        for (String d : denied) {
+            for (String route : new String[]{"stream", "probe", "warm"}) {
+                int code = http("GET", strokuUrl(gp, route, d), null).code;
+                if (code != 403) {
+                    allDenied = false;
+                    System.out.println("      NOT DENIED (" + code + ") on /" + route + ": " + d);
+                }
+            }
+        }
+        check(allDenied, "all " + denied.length + " disallowed targets are refused (403) on /stream, /probe and /warm");
+        check(http("GET", "http://127.0.0.1:" + gp + "/stream", null).code == 400, "/stream without url -> 400");
+        check(http("GET", "http://127.0.0.1:" + gp + "/probe", null).code == 400, "/probe without url -> 400");
+        r = http("GET", strokuUrl(gp, "probe", kira(ep, magnet("dddddddddddddddddddddddddddddddddddddddd"), "")), null);
+        check((r.code == 502 || r.code == 504) && new String(r.body, "UTF-8").contains("\"ok\":false"), "/probe on a torrent without metadata -> JSON error " + r.code);
+
+        System.out.println("\n[10] ports already taken by another app");
+        try (java.net.ServerSocket squat = new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
+            Config c2 = new Config();
+            c2.gatewayBind = "127.0.0.1";
+            c2.gatewayPort = 0;
+            c2.enginePort = squat.getLocalPort();
+            c2.cacheDir = tmp.resolve("cache2").toFile();
+            EngineServer e2 = new EngineServer(c2, backend);
+            e2.start();
+            check(c2.enginePort != squat.getLocalPort() && NetUtil.tcpOpen("127.0.0.1", c2.enginePort, 1000),
+                    "engine busy port -> falls back to a free loopback port (" + c2.enginePort + ")");
+            e2.close();
+            Config c3 = new Config();
+            c3.gatewayBind = "127.0.0.1";
+            c3.gatewayPort = squat.getLocalPort();
+            c3.enginePort = 0;
+            c3.cacheDir = tmp.resolve("cache3").toFile();
+            Gateway g3 = new Gateway(c3, new BlockCache(c3.cacheDir, 1024 * 1024));
+            String err = "";
+            try {
+                g3.start();
+            } catch (java.io.IOException busyEx) {
+                err = busyEx.getMessage();
+            }
+            check(err.contains("" + squat.getLocalPort()) && err.contains("ocupado"), "gateway busy port -> clear error naming the port: " + err);
+            g3.close();
+        }
 
         System.out.println("\n[8] shutdown");
         gw.close();

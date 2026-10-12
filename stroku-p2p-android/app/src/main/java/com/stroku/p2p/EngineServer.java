@@ -34,7 +34,13 @@ public final class EngineServer implements Closeable {
     public void start() throws IOException {
         server = new MiniHttpServer("engine", cfg.maxConnections, cfg.engineIdleMs,
                 addr -> addr.isLoopbackAddress(), this::handle);
-        server.start(cfg.engineHost, cfg.enginePort);
+        try {
+            server.start(cfg.engineHost, cfg.enginePort);
+        } catch (java.net.BindException e) {
+            // The internal port is private to this app: if another process owns it, use a free one.
+            Logx.w(TAG, "port " + cfg.enginePort + " is taken by another app (" + e.getMessage() + "); using a free loopback port");
+            server.start(cfg.engineHost, 0);
+        }
         cfg.enginePort = server.getPort();
     }
 
@@ -78,9 +84,37 @@ public final class EngineServer implements Closeable {
             Logx.w(TAG, "resolve failed for " + p.infoHash + ": " + e.getMessage());
             throw new MiniHttpServer.HttpError(504, "metadata unavailable: " + e.getMessage());
         }
-        TorrentBackend.FileMeta f = meta.files.get(meta.bestFile);
+        TorrentBackend.FileMeta f = pickFile(meta, req.query.get("file"), req.query.get("fileIndex"));
         String name = f.path.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
         res.text(200, "text/plain; charset=utf-8", meta.infoHash + "\t" + f.index + "\t" + f.size + "\t" + name + "\n");
+    }
+
+    /**
+     * File selection as Stroku asks for it: "file" is a file name (Stremio filename hint) and
+     * "fileIndex" is ONE-based. Falls back to the largest video file.
+     */
+    static TorrentBackend.FileMeta pickFile(TorrentBackend.Meta meta, String name, String idx1) {
+        if (idx1 != null && idx1.length() <= 6) {
+            try {
+                int i = Integer.parseInt(idx1.trim());
+                if (i >= 1 && i <= meta.files.size()) return meta.files.get(i - 1);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (name != null && !name.trim().isEmpty() && name.length() <= 512) {
+            String n = name.trim().replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
+            for (int pass = 0; pass < 3; pass++) {
+                for (TorrentBackend.FileMeta f : meta.files) {
+                    String p = f.path.replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
+                    String base = p.substring(p.lastIndexOf('/') + 1);
+                    boolean hit = pass == 0 ? (p.equals(n) || p.endsWith("/" + n))
+                            : pass == 1 ? base.equals(n.substring(n.lastIndexOf('/') + 1))
+                            : p.contains(n);
+                    if (hit) return f;
+                }
+            }
+        }
+        return meta.files.get(meta.bestFile);
     }
 
     private void stream(MiniHttpServer.Request req, MiniHttpServer.Response res, String hash, int idx) throws Exception {

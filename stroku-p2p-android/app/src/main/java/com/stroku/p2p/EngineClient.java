@@ -74,8 +74,10 @@ public final class EngineClient {
         }
     }
 
-    public Resolved resolve(String sanitizedMagnet) throws IOException {
+    public Resolved resolve(String sanitizedMagnet, String file, int fileIndex1) throws IOException {
         String path = "/resolve?magnet=" + URLEncoder.encode(sanitizedMagnet, "UTF-8");
+        if (file != null && !file.isEmpty()) path += "&file=" + URLEncoder.encode(file, "UTF-8");
+        if (fileIndex1 > 0) path += "&fileIndex=" + fileIndex1;
         HttpURLConnection c = open(path, (int) cfg.metadataTimeoutMs + 15_000);
         try {
             ensureOk(c, 200);

@@ -6,6 +6,8 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -83,7 +85,27 @@ public final class Gateway implements Closeable {
         demandPool = Executors.newFixedThreadPool(6, r -> daemon(r, "gw-demand"));
         prefetchPool = Executors.newFixedThreadPool(Math.max(1, cfg.parallelFetches), r -> daemon(r, "gw-prefetch"));
         server = new MiniHttpServer("gateway", cfg.maxConnections, cfg.gatewayIdleMs, Gateway::lanClient, this::handle);
-        server.start(cfg.gatewayBind, cfg.gatewayPort);
+        java.io.IOException last = null;
+        for (int i = 0; i < 4; i++) { // a just-closed socket from a previous run can need a moment
+            try {
+                server.start(cfg.gatewayBind, cfg.gatewayPort);
+                last = null;
+                break;
+            } catch (java.net.BindException e) {
+                last = e;
+                Logx.w("gateway", "bind " + cfg.gatewayPort + " failed (try " + (i + 1) + "/4): " + e.getMessage());
+                try {
+                    Thread.sleep(700);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        if (last != null) {
+            throw new java.io.IOException("El puerto " + cfg.gatewayPort + " (gateway) está ocupado por otra app o por una instancia anterior. "
+                    + "Cierra esa app (o reinicia el teléfono) y vuelve a iniciar. Detalle: " + last.getMessage(), last);
+        }
         cfg.gatewayPort = server.getPort();
     }
 
@@ -111,11 +133,18 @@ public final class Gateway implements Closeable {
             case "/health":
                 health(res);
                 return;
-            case "/play":
+            case "/play":      // simple form: /play?magnet=...
+            case "/stream":    // Stroku's contract: /stream?url=http://127.0.0.1:3000/stream/<magnet>?file=...
                 play(req, res);
                 return;
+            case "/probe":
+                probe(req, res);
+                return;
+            case "/warm":
+                warm(req, res);
+                return;
             case "/":
-                res.text(200, "text/plain; charset=utf-8", "Stroku P2P gateway. Use /play?magnet=... or /health\n");
+                res.text(200, "text/plain; charset=utf-8", "Stroku P2P gateway. Use /stream?url=..., /probe, /warm, /play?magnet=... or /health\n");
                 return;
             default:
                 throw new MiniHttpServer.HttpError(404, "not found");
@@ -169,26 +198,21 @@ public final class Gateway implements Closeable {
     // ------------------------------------------------------------------ /play
 
     private void play(MiniHttpServer.Request req, MiniHttpServer.Response res) throws Exception {
-        MagnetUtil.Parsed pm;
-        try {
-            pm = MagnetUtil.parse(magnetParam(req));
-        } catch (IllegalArgumentException e) {
-            throw new MiniHttpServer.HttpError(400, "invalid magnet: " + e.getMessage());
-        }
+        final Sel sel = selection(req);
         final int bs = cfg.blockSize;
         Ref ref = null;
         BlockCache.Lease first = null;
         ByteRange range = null;
         for (int attempt = 0; attempt < 2 && first == null; attempt++) {
             try {
-                ref = resolve(pm);
+                ref = resolve(sel);
                 range = ByteRange.parse(req.header("range"), ref.size);
                 if (range != null && range.isInvalid()) break;
                 long start = range == null ? 0 : range.start;
                 if (!req.isHead() && ref.size > 0) first = getBlock(ref, (int) (start / bs));
                 else break;
             } catch (EngineClient.NotFound nf) {
-                refs.remove(pm.infoHash); // engine dropped the torrent: resolve again
+                refs.remove(sel.key()); // engine dropped the torrent: resolve again
                 if (attempt == 1) throw new MiniHttpServer.HttpError(502, "torrent no longer available");
             } catch (IOException e) {
                 throw new MiniHttpServer.HttpError(e instanceof TimeoutLike ? 504 : 502, "upstream failure: " + e.getMessage());
@@ -227,14 +251,15 @@ public final class Gateway implements Closeable {
         }
     }
 
-    private Ref resolve(MagnetUtil.Parsed pm) throws IOException {
+    private Ref resolve(Sel sel) throws IOException {
+        final String k = sel.key();
         CompletableFuture<Ref> f = new CompletableFuture<>();
-        CompletableFuture<Ref> existing = refs.putIfAbsent(pm.infoHash, f);
+        CompletableFuture<Ref> existing = refs.putIfAbsent(k, f);
         if (existing == null) {
             try {
-                f.complete(new Ref(engine.resolve(pm.sanitized)));
+                f.complete(new Ref(engine.resolve(sel.parsed.sanitized, sel.file, sel.fileIndex)));
             } catch (Throwable t) {
-                refs.remove(pm.infoHash, f);
+                refs.remove(k, f);
                 f.completeExceptionally(t);
             }
             existing = f;
@@ -242,7 +267,7 @@ public final class Gateway implements Closeable {
         try {
             return existing.get(cfg.metadataTimeoutMs + 20_000, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
-            refs.remove(pm.infoHash, existing);
+            refs.remove(k, existing);
             Throwable c = e.getCause();
             if (c instanceof IOException) throw (IOException) c;
             throw new IOException(String.valueOf(c), c);
@@ -252,6 +277,215 @@ public final class Gateway implements Closeable {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted");
         }
+    }
+
+    // ------------------------------------------------------------------ request selection
+
+    /** What the client wants: a magnet plus an optional file selector (name or one-based index). */
+    private static final class Sel {
+        final MagnetUtil.Parsed parsed;
+        final String file;     // file name hint or null
+        final int fileIndex;   // one-based, 0 = none
+
+        Sel(MagnetUtil.Parsed parsed, String file, int fileIndex) {
+            this.parsed = parsed;
+            this.file = file;
+            this.fileIndex = fileIndex;
+        }
+
+        String key() {
+            return parsed.infoHash + "|" + (file == null ? "" : file) + "|" + fileIndex;
+        }
+    }
+
+    private Sel selection(MiniHttpServer.Request req) throws MiniHttpServer.HttpError {
+        if (req.path.equals("/play")) {
+            try {
+                return new Sel(MagnetUtil.parse(magnetParam(req)), null, 0);
+            } catch (IllegalArgumentException e) {
+                throw new MiniHttpServer.HttpError(400, "invalid magnet: " + e.getMessage());
+            }
+        }
+        String url = req.query.get("url");
+        if (url == null || url.isEmpty()) throw new MiniHttpServer.HttpError(400, "Missing ?url=");
+        return parseTarget(url);
+    }
+
+    /**
+     * Accepts only what Stroku sends: http(s)://127.0.0.1:<engine port>/stream/<encoded magnet>
+     * with an optional ?file=<name> or ?fileIndex=<one-based>. Anything else is refused, and the
+     * parsed pieces (not the client's URL) are what the engine client later uses.
+     */
+    private Sel parseTarget(String raw) throws MiniHttpServer.HttpError {
+        final MiniHttpServer.HttpError denied = new MiniHttpServer.HttpError(403, "Target not allowed");
+        if (raw.length() > 8192) throw denied;
+        URI u;
+        try {
+            u = new URI(raw);
+        } catch (URISyntaxException e) {
+            throw denied;
+        }
+        String scheme = u.getScheme();
+        if (!"http".equals(scheme) && !"https".equals(scheme)) throw denied;
+        if (u.getRawUserInfo() != null || u.getRawFragment() != null) throw denied;
+        if (!cfg.engineHost.equals(u.getHost()) || (u.getPort() != cfg.contractEnginePort 
+                && u.getPort() != cfg.enginePort)) throw denied;
+        String rp = u.getRawPath();
+        if (rp == null || !rp.startsWith("/stream/")) throw denied;
+        String seg = rp.substring(8);
+        if (seg.isEmpty() || seg.indexOf('/') >= 0) throw denied;
+        MagnetUtil.Parsed pm;
+        try {
+            pm = MagnetUtil.parse(pctDecode(seg));
+        } catch (IllegalArgumentException e) {
+            throw new MiniHttpServer.HttpError(400, "invalid magnet: " + e.getMessage());
+        }
+        String file = null;
+        int idx = 0;
+        String q = u.getRawQuery();
+        if (q != null) {
+            for (String kv : q.split("&")) {
+                int eq = kv.indexOf('=');
+                if (eq <= 0) continue;
+                String k = kv.substring(0, eq);
+                String v;
+                try {
+                    v = URLDecoder.decode(kv.substring(eq + 1), "UTF-8");
+                } catch (Exception e) {
+                    continue;
+                }
+                if (k.equals("file") && file == null && v.length() <= 512) file = v;
+                else if (k.equals("fileIndex") && idx == 0 && v.length() <= 6) {
+                    try {
+                        idx = Math.max(0, Integer.parseInt(v.trim()));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+        }
+        return new Sel(pm, file, idx);
+    }
+
+    /** Percent-decoding for a path segment ('+' stays a plus). */
+    private static String pctDecode(String s) {
+        try {
+            return URLDecoder.decode(s.replace("+", "%2B"), "UTF-8");
+        } catch (Exception e) {
+            throw new IllegalArgumentException("bad percent-encoding");
+        }
+    }
+
+    // ------------------------------------------------------------------ /probe and /warm
+
+    private void jsonError(MiniHttpServer.Response res, int code, String msg) throws IOException {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("ok", false);
+        m.put("error", msg);
+        res.text(code, "application/json", Json.write(m));
+    }
+
+    private Ref refOrFail(MiniHttpServer.Request req, MiniHttpServer.Response res, Sel[] out) throws IOException {
+        try {
+            out[0] = selection(req);
+        } catch (MiniHttpServer.HttpError e) {
+            jsonError(res, e.status, e.getMessage());
+            return null;
+        }
+        try {
+            return resolve(out[0]);
+        } catch (IOException e) {
+            jsonError(res, e instanceof TimeoutLike ? 504 : 502, String.valueOf(e.getMessage()));
+            return null;
+        }
+    }
+
+    private static String param(MiniHttpServer.Request req, String k) {
+        String v = req.query.get(k);
+        return v == null ? "" : (v.length() > 40 ? v.substring(0, 40) : v);
+    }
+
+    /** Measures real startup throughput by downloading the first 3 blocks (12 MiB at defaults). */
+    private void probe(MiniHttpServer.Request req, MiniHttpServer.Response res) throws Exception {
+        Sel[] sel = new Sel[1];
+        Ref ref = refOrFail(req, res, sel);
+        if (ref == null) return;
+        final String quality = param(req, "quality");
+        long t0 = System.nanoTime();
+        long bytes = 0;
+        int blocks = 0;
+        Flow fl = flows.computeIfAbsent(ref.key(), k -> new Flow());
+        try {
+            for (int i = 0; i < 3 && i < ref.blocks(cfg.blockSize); i++) {
+                try (BlockCache.Lease l = getBlock(ref, i)) {
+                    bytes += l.file.length();
+                    blocks++;
+                }
+            }
+        } catch (IOException e) {
+            jsonError(res, e instanceof TimeoutLike ? 504 : 502, String.valueOf(e.getMessage()));
+            return;
+        }
+        fl.lastBlock = -1; // the real playback will start at block 0: that is not a seek
+        long ms = Math.max(1, (System.nanoTime() - t0) / 1_000_000L);
+        long rate = Math.round(bytes / (ms / 1000.0));
+        double required = 1.5 * 1024 * 1024;
+        if (quality.equals("2160p")) required = 4.0 * 1024 * 1024;
+        else if (quality.equals("720p")) required = 0.9 * 1024 * 1024;
+        else if (quality.equals("480p")) required = 0.5 * 1024 * 1024;
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("ok", true);
+        m.put("stable", blocks >= 2 && rate >= required);
+        m.put("stabilityScore", Math.max(0, Math.min(100, Math.round(rate / required * 100))));
+        m.put("throughputBytesPerSec", rate);
+        m.put("requiredBytesPerSec", Math.round(required));
+        m.put("bytes", bytes);
+        m.put("blocks", blocks);
+        m.put("warmedMiB", Math.round(bytes / 1024.0 / 1024.0));
+        m.put("ms", ms);
+        m.put("language", param(req, "lang"));
+        m.put("quality", quality);
+        m.put("codec", param(req, "codec"));
+        m.put("cache", "ready");
+        res.text(200, "application/json", Json.write(m));
+    }
+
+    /** Pre-loads the first two blocks and keeps prefetching in the background. */
+    private void warm(MiniHttpServer.Request req, MiniHttpServer.Response res) throws Exception {
+        Sel[] sel = new Sel[1];
+        Ref ref = refOrFail(req, res, sel);
+        if (ref == null) return;
+        long t0 = System.nanoTime();
+        int total = ref.blocks(cfg.blockSize);
+        long bytes = 0;
+        try {
+            if (total > 1) task(ref, 1, true); // start block 1 in parallel with block 0
+            try (BlockCache.Lease l = getBlock(ref, 0)) {
+                bytes += l.file.length();
+            }
+            if (total > 1) {
+                try (BlockCache.Lease l = getBlock(ref, 1)) {
+                    bytes += l.file.length();
+                } catch (IOException ignored) {
+                    // block 0 is what makes the start possible; block 1 is a bonus
+                }
+            }
+        } catch (IOException e) {
+            jsonError(res, e instanceof TimeoutLike ? 504 : 502, String.valueOf(e.getMessage()));
+            return;
+        }
+        Flow fl = flows.computeIfAbsent(ref.key(), k -> new Flow());
+        fl.lastBlock = -1;
+        prefetch(ref, fl, 2, cfg.prefetchMinBlocks, total - 1);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("ok", true);
+        m.put("warmedMiB", Math.round(bytes / 1024.0 / 1024.0));
+        m.put("sizeBytes", ref.size);
+        m.put("ms", Math.max(1, (System.nanoTime() - t0) / 1_000_000L));
+        m.put("language", param(req, "lang"));
+        m.put("quality", param(req, "quality"));
+        m.put("codec", param(req, "codec"));
+        m.put("cache", "ready");
+        res.text(200, "application/json", Json.write(m));
     }
 
     private void streamBlocks(Ref ref, long start, long end, OutputStream out, BlockCache.Lease firstLease) throws IOException {
