@@ -3,7 +3,7 @@ name: Build Stroku P2P Server APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, 'claude/**']
 
 jobs:
   build:
@@ -19,6 +19,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Real HTTP tests of the gateway + internal engine API against a fake in-memory torrent
+      # backend (Range/206, security checks, cache rules, errors). Pure JVM: libtorrent4j and
+      # Android are NOT exercised here.
+      - name: Gateway self-test (JVM)
+        run: |
+          set -e
+          mkdir -p build/selftest
+          SRC=stroku-p2p-android/app/src/main/java/com/stroku/p2p
+          javac --release 17 -d build/selftest \
+            $SRC/{Config,Logx,Json,ByteRange,MagnetUtil,MiniHttpServer,TorrentBackend,EngineServer,EngineClient,BlockCache,Gateway,NetUtil,ServerState,StatusProbe}.java \
+            stroku-p2p-android/selftest/GatewaySelfTest.java
+          java -cp build/selftest GatewaySelfTest | tee build/selftest.log
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -27,9 +40,28 @@ jobs:
       - name: Build APK
         run: gradle -p stroku-p2p-android assembleDebug
 
+      - name: Verify APK contents
+        run: |
+          set -e
+          APK=stroku-p2p-android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libtorrent4j\.so' \
+            || { echo "ERROR: libtorrent4j native library is missing from the APK"; exit 1; }
+          for cls in 'Lcom/stroku/p2p/LibtorrentBackend;' 'Lcom/stroku/p2p/Gateway;' 'Lcom/stroku/p2p/P2PService;'; do
+            unzip -p "$APK" 'classes*.dex' | grep -a -q "$cls" \
+              || { echo "ERROR: $cls not found in the dex files"; exit 1; }
+          done
+          echo "APK contains the native torrent library and the server classes"
+          ls -l "$APK"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Stroku-P2P-Server-APK
           path: stroku-p2p-android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Upload self-test log
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-selftest-log
+          path: build/selftest.log

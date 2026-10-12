@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">Stroku P2P Server</string>
+    <string name="notif_starting">Iniciando servidor…</string>
+    <string name="notif_running">Activo en %1$s</string>
+    <string name="notif_no_lan">Activo, pero sin IP LAN (¿Wi-Fi apagado?)</string>
+    <string name="notif_stop">Detener</string>
 </resources>
