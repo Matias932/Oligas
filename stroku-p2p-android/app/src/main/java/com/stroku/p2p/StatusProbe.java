@@ -25,7 +25,16 @@ public final class StatusProbe {
         r.lanIp = NetUtil.lanAddress();
         if (r.lanIp == null) r.lanIp = "";
         if (cfg == null) {
+            Config d = new Config();
+            r.enginePort = d.enginePort;
+            r.gatewayPort = d.gatewayPort;
             r.error = "el servidor no se ha iniciado";
+            if (NetUtil.tcpOpen("127.0.0.1", d.gatewayPort, 800)) {
+                r.error += " · AVISO: el puerto " + d.gatewayPort + " ya lo usa otro programa: " + NetUtil.whoIsOn(d.gatewayPort);
+            }
+            if (NetUtil.tcpOpen("127.0.0.1", d.enginePort, 800)) {
+                r.error += " · AVISO: el puerto " + d.enginePort + " ya lo usa otro programa: " + NetUtil.whoIsOn(d.enginePort);
+            }
             return r;
         }
         r.enginePort = cfg.enginePort;

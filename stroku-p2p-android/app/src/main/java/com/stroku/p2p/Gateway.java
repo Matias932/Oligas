@@ -103,8 +103,8 @@ public final class Gateway implements Closeable {
             }
         }
         if (last != null) {
-            throw new java.io.IOException("El puerto " + cfg.gatewayPort + " (gateway) está ocupado por otra app o por una instancia anterior. "
-                    + "Cierra esa app (o reinicia el teléfono) y vuelve a iniciar. Detalle: " + last.getMessage(), last);
+            throw new java.io.IOException("El puerto " + cfg.gatewayPort + " (gateway) está ocupado por otro programa. Quien responde ahí: ["
+                    + NetUtil.whoIsOn(cfg.gatewayPort) + "]. Ciérralo (Termux, otro servidor, versión vieja) y reintenta. ", last);
         }
         cfg.gatewayPort = server.getPort();
     }

@@ -38,7 +38,7 @@ public final class EngineServer implements Closeable {
             server.start(cfg.engineHost, cfg.enginePort);
         } catch (java.net.BindException e) {
             // The internal port is private to this app: if another process owns it, use a free one.
-            Logx.w(TAG, "port " + cfg.enginePort + " is taken by another app (" + e.getMessage() + "); using a free loopback port");
+            Logx.w(TAG, "port " + cfg.enginePort + " is taken by another app (" + e.getMessage() + "); using a free loopback port. Who answers there: " + NetUtil.whoIsOn(cfg.enginePort));
             server.start(cfg.engineHost, 0);
         }
         cfg.enginePort = server.getPort();
